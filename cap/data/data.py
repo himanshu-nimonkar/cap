@@ -1,8 +1,10 @@
 import os
+import random
+import pandas as pd
 import numpy as np
 import torch
-from random import shuffle
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
+
 
 def _init_dim(path):
     """
@@ -108,7 +110,62 @@ class LazySequenceDataset(Dataset):
             ipt = _normalize_data(ipt)
             opt = _normalize_data(opt)
         return torch.tensor(ipt, dtype=torch.float32), torch.tensor(opt, dtype=torch.float32)
+    
 
+class CSVSequenceDataset(torch.utils.data.Dataset):
+    """
+    Lazy PyTorch Dataset that:
+     - auto-loads a CSV (first column = timestamp, last = target)
+     - builds seq_len-step input (prev-target + all context cols)
+       and pred_len-step output (target only)
+     - does per-sample z-normalization if requested
+    """
+    def __init__(self, csv_path,
+                 seq_len=3, pred_len=3,
+                 normalization=True):
+        df = pd.read_csv(csv_path)
+        cols = df.columns.tolist()
+        # auto-detect:
+        #   timestamp = cols[0], context = cols[1:-1], target = cols[-1]
+        self.context_cols = cols[1:-1]
+        self.target_col  = cols[-1]
+
+        # raw arrays
+        self.context = df[self.context_cols].values.astype(float)   # shape (N, C)
+        self.target  = df[self.target_col].values.astype(float)     # shape (N,)
+        self.N       = len(df)
+
+        self.seq_len  = seq_len
+        self.pred_len = pred_len
+        self.norm     = normalization
+
+        # valid start indices: i in [1, N - (seq_len+pred_len)]
+        last = self.N - (seq_len + pred_len)
+        self.starts = list(range(1, last+1)) if last >= 1 else []
+
+    def __len__(self):
+        return len(self.starts)
+
+    def __getitem__(self, idx):
+        s = self.starts[idx]
+        # build input sequence
+        inp = []
+        for t in range(s, s + self.seq_len):
+            # prev-target + all context features
+            inp.append([ self.target[t-1], *self.context[t] ])
+        # build output sequence
+        out = [[ self.target[t] ]
+               for t in range(s + self.seq_len,
+                              s + self.seq_len + self.pred_len)]
+
+        if self.norm:
+            inp = _normalize_data(inp)
+            out = _normalize_data(out)
+
+        return (
+          torch.tensor(inp, dtype=torch.float32),    # [seq_len, C+1]
+          torch.tensor(out, dtype=torch.float32)     # [pred_len, 1]
+        )
 
 
 class Corpus:
@@ -126,7 +183,7 @@ class Corpus:
         base_dataset = LazySequenceDataset(path, normalization=True)
         total_samples = len(base_dataset)
         indices = list(range(total_samples))
-        shuffle(indices)
+        random.shuffle(indices)
         train_cnt = int(total_samples * train_size)
         valid_cnt = int(total_samples * valid_size)
 
@@ -219,33 +276,60 @@ def collate_fn(batch):
     return ipt_tensor, opt_tensor
 
 
-def get_dataloaders(path, batch_size=32, shuffle=True, train_size=0.8, valid_size=0.1, test_size=0.1, model_type='lstm', normalization=True):
+def get_dataloaders(path,
+                    batch_size=32,
+                    shuffle=True,
+                    train_size=0.8,
+                    valid_size=0.1,
+                    test_size=0.1,
+                    model_type='lstm',
+                    normalization=True):
     """
-    Creates DataLoaders for training, validation, and testing.
-    Args:
-        path (str): Path to the dataset file.
-        batch_size (int): Batch size for the DataLoader.
-        shuffle (bool): Whether to shuffle the dataset.
-    Returns:
-        tuple: (train_loader, valid_loader, test_loader)
+    Detects .csv → uses CSVSequenceDataset;
+    else falls back to TXT-based Corpus.
     """
-    corpus = Corpus(path, train_size, valid_size, test_size, normalization=normalization)
-    if model_type in ['lstm', 'autoformer', 'informer']:
-        if model_type == 'autoformer':
-            train_loader = DataLoader(corpus.train, batch_size=batch_size, shuffle=shuffle, num_workers=4, collate_fn=collate_fn_autoformer)
-            valid_loader = DataLoader(corpus.valid, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn_autoformer, drop_last=True)
-            test_loader = DataLoader(corpus.test, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn_autoformer)
-        elif model_type == 'informer' or model_type == 'fedformer':
-            train_loader = DataLoader(corpus.train, batch_size=batch_size, shuffle=shuffle, num_workers=4, collate_fn=collate_fn_informer)
-            valid_loader = DataLoader(corpus.valid, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn_informer, drop_last=True)        
-            test_loader = DataLoader(corpus.test, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn_informer)
-        else: 
-            train_loader = DataLoader(corpus.train, batch_size=batch_size, shuffle=shuffle, num_workers=4, collate_fn=collate_fn)
-            valid_loader = DataLoader(corpus.valid, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn, drop_last=True)
-            test_loader = DataLoader(corpus.test, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn)
-    else:
-        train_loader = DataLoader(corpus.train, batch_size=batch_size, shuffle=shuffle, num_workers=4)
-        valid_loader = DataLoader(corpus.valid, batch_size=batch_size, shuffle=False, num_workers=4, drop_last=True)
-        test_loader = DataLoader(corpus.test, batch_size=1, shuffle=False, num_workers=4)
+    if path.lower().endswith('.csv'):
+        ds = CSVSequenceDataset(path,
+                                seq_len=3,
+                                pred_len=3,
+                                normalization=normalization)
+        N    = len(ds)
+        idxs = list(range(N))
+        random.shuffle(idxs)
+        n1 = int(N * train_size)
+        n2 = int(N * valid_size)
 
-    return train_loader, valid_loader, test_loader
+        train_ds = Subset(ds, idxs[:n1])
+        valid_ds = Subset(ds, idxs[n1:n1+n2])
+        test_ds  = Subset(ds, idxs[n1+n2:])
+
+        ds_train, ds_valid, ds_test = train_ds, valid_ds, test_ds
+        in_dim   = 1 + len(ds.context_cols)
+        out_dim  = 1
+        seq_len  = ds.seq_len
+        pred_len = ds.pred_len
+    else:
+        corpus = Corpus(path, train_size, valid_size, test_size, normalization=normalization)
+        ds_train, ds_valid, ds_test = corpus.train, corpus.valid, corpus.test
+        in_dim, out_dim, seq_len, pred_len, _ = _init_dim(path)
+
+    # now build the three DataLoaders with your existing collate logic
+    if model_type == 'autoformer':
+        return (
+            DataLoader(ds_train, batch_size=batch_size, shuffle=shuffle,  num_workers=4, collate_fn=collate_fn_autoformer),
+            DataLoader(ds_valid, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn_autoformer, drop_last=True),
+            DataLoader(ds_test,  batch_size=1,          shuffle=False, num_workers=4, collate_fn=collate_fn_autoformer)
+        )
+    elif model_type in ['informer','fedformer']:
+        return (
+            DataLoader(ds_train, batch_size=batch_size, shuffle=shuffle,  num_workers=4, collate_fn=collate_fn_informer),
+            DataLoader(ds_valid, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn_informer, drop_last=True),
+            DataLoader(ds_test,  batch_size=1,          shuffle=False, num_workers=4, collate_fn=collate_fn_informer)
+        )
+    else:
+        return (
+            DataLoader(ds_train, batch_size=batch_size, shuffle=shuffle,  num_workers=4, collate_fn=collate_fn),
+            DataLoader(ds_valid, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn, drop_last=True),
+            DataLoader(ds_test,  batch_size=1,          shuffle=False, num_workers=4, collate_fn=collate_fn)
+        )
+    
