@@ -28,7 +28,13 @@ def main():
     # Load configuration
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-    
+
+    # Check CUDA availability and fall back to CPU if needed
+    cfg_dev = config['training']['device']
+    if cfg_dev.lower() == 'cuda' and not torch.cuda.is_available():
+        print("Warning: CUDA requested but not available. Falling back to CPU.")
+        config['training']['device'] = 'cpu'
+
     # Override config with command line arguments if provided
     if args.model_type:
         config['model']['type'] = args.model_type
@@ -47,8 +53,12 @@ def main():
     train_loader, valid_loader, test_loader = get_dataloaders(
         path=config['dataset']['path'],
         batch_size=config['dataset']['batch_size'],
-        model_type=config['model']['type'],
-        normalization=True
+        shuffle=True,
+        train_size = config['dataset']['train_size'],
+        valid_size = config['dataset']['valid_size'],
+        test_size  = config['dataset']['test_size'],
+        model_type = config['model']['type'],
+        normalization = config['dataset'].get('normalization', True)
     )
 
     # Get input and output dimensions from the first batch
